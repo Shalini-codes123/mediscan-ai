@@ -1,0 +1,14 @@
+{
+  "diabetes": {
+    "accuracy": 0.7467532467532467,
+    "auc": 0.8290740740740741
+  },
+  "heart": {
+    "accuracy": 1.0,
+    "auc": 1.0
+  },
+  "kidney": {
+    "accuracy": 1.0,
+    "auc": 1.0
+  }
+}

@@ -1,0 +1,114 @@
+### MediScan AI — API Tests
+### Install "REST Client" VS Code extension, then click "Send Request"
+
+@base = http://localhost:5000
+
+### Health check
+GET {{base}}/health
+
+###
+
+### Get all model metrics
+GET {{base}}/metrics
+
+###
+
+### Predict diabetes (positive case)
+POST {{base}}/predict/diabetes
+Content-Type: application/json
+
+{
+  "Pregnancies": 6,
+  "Glucose": 148,
+  "BloodPressure": 72,
+  "SkinThickness": 35,
+  "Insulin": 0,
+  "BMI": 33.6,
+  "DiabetesPedigreeFunction": 0.627,
+  "Age": 50
+}
+
+###
+
+### Predict diabetes (negative case)
+POST {{base}}/predict/diabetes
+Content-Type: application/json
+
+{
+  "Pregnancies": 1,
+  "Glucose": 85,
+  "BloodPressure": 66,
+  "SkinThickness": 29,
+  "Insulin": 0,
+  "BMI": 26.6,
+  "DiabetesPedigreeFunction": 0.351,
+  "Age": 31
+}
+
+###
+
+### Predict heart disease (high risk)
+POST {{base}}/predict/heart
+Content-Type: application/json
+
+{
+  "age": 63,
+  "sex": 1,
+  "cp": 3,
+  "trestbps": 145,
+  "chol": 233,
+  "fbs": 1,
+  "restecg": 0,
+  "thalach": 150,
+  "exang": 0,
+  "oldpeak": 2.3,
+  "slope": 0,
+  "ca": 0,
+  "thal": 1
+}
+
+###
+
+### Predict kidney disease (CKD positive)
+POST {{base}}/predict/kidney
+Content-Type: application/json
+
+{
+  "age": 55,
+  "bp": 80,
+  "sg": 1.010,
+  "al": 3,
+  "su": 2,
+  "bgr": 148,
+  "bu": 75,
+  "sc": 4.5,
+  "sod": 134,
+  "pot": 4.8,
+  "hemo": 10,
+  "pcv": 32,
+  "wbcc": 9200,
+  "rbcc": 3.6
+}
+
+###
+
+### Predict kidney disease (healthy)
+POST {{base}}/predict/kidney
+Content-Type: application/json
+
+{
+  "age": 35,
+  "bp": 70,
+  "sg": 1.020,
+  "al": 0,
+  "su": 0,
+  "bgr": 90,
+  "bu": 18,
+  "sc": 0.9,
+  "sod": 140,
+  "pot": 4.0,
+  "hemo": 14.5,
+  "pcv": 44,
+  "wbcc": 7200,
+  "rbcc": 5.0
+}
