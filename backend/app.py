@@ -2,13 +2,16 @@ import os, json, base64, io, hashlib, logging
 import numpy as np
 import joblib
 from pathlib import Path
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mediscan")
 
 app = Flask(__name__)
 
+# ─────────────────────────────────────────
+# CORS
+# ─────────────────────────────────────────
 @app.after_request
 def add_cors(response):
     response.headers["Access-Control-Allow-Origin"]  = os.getenv("CORS_ORIGIN", "*")
@@ -21,11 +24,47 @@ def add_cors(response):
 def options_handler(path=""):
     return "", 200
 
-MODEL_DIR = Path(__file__).parent / "models"
-MODELS, META = {}, {}
 
 # ─────────────────────────────────────────
-# ✅ LOAD METRICS (NEW SOURCE OF TRUTH)
+# 📦 MODEL DOWNLOAD (CRITICAL FIX)
+# ─────────────────────────────────────────
+MODEL_DIR = Path(__file__).parent / "models"
+MODEL_DIR.mkdir(exist_ok=True)
+
+HF_REPO = os.getenv("HF_REPO")  # e.g. "yourusername/mediscan-models"
+
+def ensure_models():
+    # If models already exist → skip
+    if any(MODEL_DIR.glob("*.pkl")):
+        logger.info("Models already present")
+        return
+
+    if not HF_REPO:
+        logger.warning("HF_REPO not set and no local models found")
+        return
+
+    try:
+        logger.info("Downloading models from Hugging Face...")
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(
+            repo_id=HF_REPO,
+            repo_type="model",
+            local_dir=str(MODEL_DIR)
+        )
+
+        logger.info("Models downloaded successfully")
+
+    except Exception as e:
+        logger.error(f"Model download failed: {e}")
+
+
+# Call before loading
+ensure_models()
+
+
+# ─────────────────────────────────────────
+# LOAD METRICS
 # ─────────────────────────────────────────
 METRICS_FILE = MODEL_DIR / "metrics.json"
 ALL_METRICS = {}
@@ -37,29 +76,32 @@ if METRICS_FILE.exists():
 else:
     logger.warning("metrics.json not found")
 
+
 # ─────────────────────────────────────────
-# ✅ LOAD MODELS (NO META FILE REQUIRED)
+# LOAD MODELS
 # ─────────────────────────────────────────
-for name in ["diabetes","heart","kidney","pneumonia","brainTumor","skinCancer"]:
+MODELS = {}
+
+MODEL_NAMES = ["diabetes","heart","kidney","pneumonia","brainTumor","skinCancer"]
+
+for name in MODEL_NAMES:
     pkl = MODEL_DIR / f"{name}.pkl"
 
     if pkl.exists():
-        MODELS[name] = joblib.load(pkl)
-
-        # Create fallback META dynamically
-        META[name] = {
-            "features": [],
-            "metrics": ALL_METRICS.get(name, {})
-        }
-
-        logger.info(f"Loaded model: {name}")
+        try:
+            MODELS[name] = joblib.load(pkl)
+            logger.info(f"Loaded model: {name}")
+        except Exception as e:
+            logger.error(f"Failed loading {name}: {e}")
     else:
         logger.warning(f"Model not found: {name}")
 
+
 IMAGE_DISEASES = {"pneumonia","brainTumor","skinCancer"}
 
+
 # ─────────────────────────────────────────
-# IMAGE FEATURE EXTRACTION (unchanged)
+# IMAGE FEATURE EXTRACTION
 # ─────────────────────────────────────────
 def image_to_features(img_bytes: bytes) -> np.ndarray:
     try:
@@ -94,12 +136,24 @@ def image_to_features(img_bytes: bytes) -> np.ndarray:
 def pad_or_trim(feat, n):
     if len(feat) >= n:
         return feat[:n]
-    return np.pad(feat, (0, n-len(feat)))
+    return np.pad(feat, (0, n - len(feat)))
 
 
 # ─────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────
+
+@app.route("/")
+def home():
+    return jsonify({
+        "message": "MediScan API is running",
+        "endpoints": [
+            "/health",
+            "/metrics",
+            "/predict/<disease>"
+        ]
+    })
+
 @app.route("/health")
 def health():
     return jsonify({
@@ -115,8 +169,12 @@ def all_metrics():
 
 @app.route("/predict/<disease>", methods=["POST"])
 def predict(disease):
+
     if disease not in MODELS:
-        return jsonify({"error": "Model not found"}), 404
+        return jsonify({
+            "error": f"Model '{disease}' not loaded",
+            "available_models": list(MODELS.keys())
+        }), 404
 
     model = MODELS[disease]
     stored_metrics = ALL_METRICS.get(disease, {})
@@ -124,9 +182,7 @@ def predict(disease):
     data = request.get_json(silent=True) or {}
     is_image = disease in IMAGE_DISEASES
 
-    # ─────────────────────────────────────
-    # IMAGE MODEL
-    # ─────────────────────────────────────
+    # IMAGE
     if is_image:
         b64 = data.get("image_b64", "")
         if not b64:
@@ -137,21 +193,16 @@ def predict(disease):
         except:
             return jsonify({"error": "Invalid image"}), 400
 
-        feat = image_to_features(img_bytes)
-        feat = feat.reshape(1, -1)
+        feat = image_to_features(img_bytes).reshape(1, -1)
 
-    # ─────────────────────────────────────
-    # TABULAR MODEL
-    # ─────────────────────────────────────
+    # TABULAR
     else:
         try:
             feat = np.array([list(map(float, data.values()))])
         except:
             return jsonify({"error": "Invalid input values"}), 400
 
-    # ─────────────────────────────────────
-    # PREDICTION
-    # ─────────────────────────────────────
+    # PREDICT
     proba = model.predict_proba(feat)[0]
     pred = int(np.argmax(proba))
 
@@ -162,5 +213,8 @@ def predict(disease):
     })
 
 
+# ─────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(debug=True)
