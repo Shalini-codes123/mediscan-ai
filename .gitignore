@@ -9,11 +9,11 @@ env/
 dist/
 build/
 
-# Models (large — store on Hugging Face Hub or DVC, not git)
+# Models (large — store on Hugging Face)
 backend/models/*.pkl
 data/
 
-# Kaggle credentials — NEVER commit
+# Kaggle credentials
 .kaggle/
 kaggle.json
 
@@ -22,8 +22,11 @@ node_modules/
 frontend/node_modules/
 
 # Build output
-backend/static/
 frontend/dist/
+
+# ❗ FIX: allow backend static (frontend build)
+!backend/static/
+!backend/static/**
 
 # Environment
 .env
