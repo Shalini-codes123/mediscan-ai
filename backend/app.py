@@ -26,7 +26,7 @@ def options_handler(path=""):
 
 
 # ─────────────────────────────────────────
-# 📦 MODEL DOWNLOAD
+# MODEL DOWNLOAD (Hugging Face)
 # ─────────────────────────────────────────
 MODEL_DIR = Path(__file__).parent / "models"
 MODEL_DIR.mkdir(exist_ok=True)
@@ -37,25 +37,16 @@ def ensure_models():
     if any(MODEL_DIR.glob("*.pkl")):
         logger.info("Models already present")
         return
-
     if not HF_REPO:
-        logger.warning("HF_REPO not set")
+        logger.warning("HF_REPO not set — skipping model download")
         return
-
     try:
         logger.info("Downloading models from Hugging Face...")
         from huggingface_hub import snapshot_download
-
-        snapshot_download(
-            repo_id=HF_REPO,
-            repo_type="model",
-            local_dir=str(MODEL_DIR)
-        )
-
-        logger.info("Models downloaded")
-
+        snapshot_download(repo_id=HF_REPO, repo_type="model", local_dir=str(MODEL_DIR))
+        logger.info("Models downloaded successfully")
     except Exception as e:
-        logger.error(f"Download failed: {e}")
+        logger.error(f"Model download failed: {e}")
 
 ensure_models()
 
@@ -65,13 +56,13 @@ ensure_models()
 # ─────────────────────────────────────────
 ALL_METRICS = {}
 metrics_file = MODEL_DIR / "metrics.json"
-
 if metrics_file.exists():
     with open(metrics_file) as f:
         ALL_METRICS = json.load(f)
+    logger.info("Loaded metrics.json")
 
-MODELS = {}
-MODEL_NAMES = ["diabetes","heart","kidney","pneumonia","brainTumor","skinCancer"]
+MODELS     = {}
+MODEL_NAMES = ["diabetes", "heart", "kidney", "pneumonia", "brainTumor", "skinCancer"]
 
 for name in MODEL_NAMES:
     pkl = MODEL_DIR / f"{name}.pkl"
@@ -81,7 +72,8 @@ for name in MODEL_NAMES:
     else:
         logger.warning(f"Model not found: {name}")
 
-IMAGE_DISEASES = {"pneumonia","brainTumor","skinCancer"}
+IMAGE_DISEASES = {"pneumonia", "brainTumor", "skinCancer"}
+
 FEATURE_ORDER = {
     "diabetes": [
         "Pregnancies", "Glucose", "BloodPressure", "SkinThickness",
@@ -96,6 +88,7 @@ FEATURE_ORDER = {
         "sod", "pot", "hemo", "pcv", "wbcc", "rbcc"
     ],
 }
+
 DISEASE_METADATA = {
     "diabetes": {
         "positive_label": "Positive",
@@ -196,8 +189,148 @@ DISEASE_METADATA = {
 }
 
 
+# ─────────────────────────────────────────
+# IMAGE FEATURE EXTRACTION
+# ─────────────────────────────────────────
+def _safe_fft(arr: np.ndarray, n: int) -> np.ndarray:
+    """
+    Always returns exactly n FFT magnitude values.
+    Zero-pads if rfft2 produces fewer coefficients than n — fixes the
+    Python 3.14 behaviour change where rfft2 output length can differ.
+    """
+    flat = np.abs(np.fft.rfft2(arr)).flatten()
+    out  = np.zeros(n, dtype=np.float32)
+    take = min(n, len(flat))
+    out[:take] = flat[:take]
+    return out
+
+
+def image_to_features_gray(img_bytes: bytes) -> np.ndarray:
+    """
+    288-dim grayscale feature vector.
+    Used for: pneumonia, brainTumor.
+
+    Layout (must match download_and_train.py exactly):
+        8   global statistics  (mean, std, min, max, p10, p25, p75, p90)
+       64   normalised pixel histogram
+      200   FFT magnitude coefficients  (zero-padded to exactly 200)
+       16   4×4 block means
+    ────
+      288   total
+    """
+    from PIL import Image
+    img = Image.open(io.BytesIO(img_bytes)).convert("L").resize((64, 64))
+    arr = np.array(img, dtype=np.float32) / 255.0
+
+    stats = [
+        arr.mean(), arr.std(), arr.min(), arr.max(),
+        np.percentile(arr, 10), np.percentile(arr, 25),
+        np.percentile(arr, 75), np.percentile(arr, 90),
+    ]                                                             # 8
+
+    hist, _ = np.histogram(arr, bins=64, range=(0, 1))
+    hist     = hist.astype(np.float32) / (hist.sum() + 1e-9)     # 64
+
+    fft = _safe_fft(arr, 200)                                     # 200
+
+    blocks = [
+        arr[i:i+16, j:j+16].mean()
+        for i in range(0, 64, 16)
+        for j in range(0, 64, 16)
+    ]                                                             # 16
+
+    return np.concatenate([stats, hist, fft, blocks]).astype(np.float32)  # 288
+
+
+def image_to_features_rgb(img_bytes: bytes) -> np.ndarray:
+    """
+    204-dim RGB feature vector.
+    Used for: skinCancer.
+
+    Layout (must match download_and_train.py exactly):
+       12   per-channel stats  (mean, std, p25, p75  ×  R, G, B)
+       64   grayscale histogram
+      128   grayscale FFT magnitude coefficients  (zero-padded to exactly 128)
+    ────
+      204   total
+    """
+    from PIL import Image
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB").resize((64, 64))
+    arr = np.array(img, dtype=np.float32) / 255.0
+
+    ch_stats = []
+    for c in range(3):
+        ch = arr[:, :, c]
+        ch_stats.extend([
+            ch.mean(), ch.std(),
+            np.percentile(ch, 25), np.percentile(ch, 75),
+        ])                                                        # 12
+
+    gray    = arr.mean(axis=2)
+    hist, _ = np.histogram(gray, bins=64, range=(0, 1))
+    hist    = hist.astype(np.float32) / (hist.sum() + 1e-9)      # 64
+
+    fft = _safe_fft(gray, 128)                                    # 128
+
+    return np.concatenate([ch_stats, hist, fft]).astype(np.float32)  # 204
+
+
+# Feature count each image model expects
+_IMAGE_FEATURE_COUNTS = {
+    "pneumonia":  288,
+    "brainTumor": 288,
+    "skinCancer": 204,
+}
+
+def extract_image_features(img_bytes: bytes, disease: str) -> np.ndarray:
+    """
+    Route to the right extractor and enforce the exact feature count
+    the stored model expects. Falls back to zeros on any error.
+    """
+    n = _IMAGE_FEATURE_COUNTS.get(disease, 288)
+    try:
+        feat = (image_to_features_rgb(img_bytes)
+                if disease == "skinCancer"
+                else image_to_features_gray(img_bytes))
+    except Exception as e:
+        logger.error(f"Feature extraction failed for {disease}: {e}")
+        return np.zeros(n, dtype=np.float32)
+
+    # Hard guarantee: model always receives exactly n features
+    if len(feat) >= n:
+        return feat[:n].astype(np.float32)
+    return np.pad(feat, (0, n - len(feat))).astype(np.float32)
+
+
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
 def clamp(value, low=0.0, high=100.0):
     return max(low, min(high, round(float(value), 2)))
+
+
+def parse_numeric_payload(disease, data):
+    required = FEATURE_ORDER[disease]
+    missing  = [f for f in required if f not in data or data[f] in ("", None)]
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
+    try:
+        return np.array([[float(data[f]) for f in required]])
+    except (TypeError, ValueError):
+        raise ValueError("All numeric inputs must be valid numbers")
+
+
+def parse_image_payload(data, disease):
+    image_b64 = data.get("image_b64")
+    if not image_b64:
+        raise ValueError("image_b64 is required")
+    try:
+        img_bytes = base64.b64decode(image_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("image_b64 must be valid raw base64 without a data URL prefix")
+    if not img_bytes:
+        raise ValueError("Decoded image is empty")
+    return extract_image_features(img_bytes, disease).reshape(1, -1)
 
 
 def build_prescription(disease, positive, risk_level):
@@ -375,9 +508,9 @@ def build_prescription(disease, positive, risk_level):
 
 
 def build_response(disease, positive_probability):
-    positive = positive_probability >= 0.5
+    positive        = positive_probability >= 0.5
     probability_pct = clamp(positive_probability * 100)
-    confidence_pct = clamp(max(positive_probability, 1 - positive_probability) * 100)
+    confidence_pct  = clamp(max(positive_probability, 1 - positive_probability) * 100)
 
     if confidence_pct >= 85:
         risk_level = "high" if positive else "low"
@@ -386,70 +519,22 @@ def build_response(disease, positive_probability):
     else:
         risk_level = "medium"
 
-    meta = DISEASE_METADATA[disease]
+    meta  = DISEASE_METADATA[disease]
     label = meta["positive_label"] if positive else meta["negative_label"]
 
     return {
-        "prediction": label,
-        "probability": probability_pct,
-        "confidence": confidence_pct,
-        "riskLevel": risk_level,
-        "findings": meta["findings"][positive],
-        "metrics": ALL_METRICS.get(disease, {}),
+        "prediction":   label,
+        "probability":  probability_pct,
+        "confidence":   confidence_pct,
+        "riskLevel":    risk_level,
+        "findings":     meta["findings"][positive],
+        "metrics":      ALL_METRICS.get(disease, {}),
         "prescription": build_prescription(disease, positive, risk_level),
         "disclaimer": (
             "This AI result is a screening aid and not a medical diagnosis. "
             "Always confirm with a qualified clinician."
         ),
     }
-
-
-def parse_numeric_payload(disease, data):
-    required = FEATURE_ORDER[disease]
-    missing = [field for field in required if field not in data or data[field] in ("", None)]
-    if missing:
-        raise ValueError(f"Missing required fields: {', '.join(missing)}")
-
-    try:
-        return np.array([[float(data[field]) for field in required]])
-    except (TypeError, ValueError):
-        raise ValueError("All numeric inputs must be valid numbers")
-
-
-def parse_image_payload(data):
-    image_b64 = data.get("image_b64")
-    if not image_b64:
-        raise ValueError("image_b64 is required")
-
-    try:
-        img = base64.b64decode(image_b64, validate=True)
-    except (binascii.Error, ValueError):
-        raise ValueError("image_b64 must be valid raw base64 without a data URL prefix")
-
-    if not img:
-        raise ValueError("Decoded image is empty")
-
-    return image_to_features(img).reshape(1, -1)
-
-
-# ─────────────────────────────────────────
-# IMAGE FEATURE EXTRACTION
-# ─────────────────────────────────────────
-def image_to_features(img_bytes):
-    try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(img_bytes)).convert("L").resize((64, 64))
-        arr = np.array(img) / 255.0
-
-        stats = [arr.mean(), arr.std(), arr.min(), arr.max()]
-        hist,_ = np.histogram(arr, bins=64, range=(0,1))
-        fft = np.abs(np.fft.rfft2(arr)).flatten()[:200]
-
-        return np.concatenate([stats, hist, fft])
-
-    except Exception as e:
-        logger.error(e)
-        return np.zeros(268)
 
 
 # ─────────────────────────────────────────
@@ -462,13 +547,23 @@ def serve_frontend():
     index = STATIC_DIR / "index.html"
     if index.exists():
         return send_from_directory(STATIC_DIR, "index.html")
-    return jsonify({"message": "Frontend not built"})
+    return jsonify({
+        "message": "MediScan API is running",
+        "endpoints": ["/health", "/metrics", "/predict/<disease>"]
+    })
 
 @app.route("/<path:path>")
 def serve_static(path):
+    # Never intercept API routes
+    if path.startswith(("predict/", "health", "metrics")):
+        return jsonify({"error": "Not found"}), 404
     file = STATIC_DIR / path
     if file.exists():
         return send_from_directory(STATIC_DIR, path)
+    # React client-side routing fallback
+    index = STATIC_DIR / "index.html"
+    if index.exists():
+        return send_from_directory(STATIC_DIR, "index.html")
     return jsonify({"error": "Not found"}), 404
 
 
@@ -479,26 +574,29 @@ def serve_static(path):
 def health():
     return jsonify({
         "status": "ok",
-        "models_loaded": list(MODELS.keys())
+        "models_loaded":  list(MODELS.keys()),
+        "models_missing": [n for n in MODEL_NAMES if n not in MODELS],
     })
 
 @app.route("/metrics")
-def metrics():
+def metrics_route():
     return jsonify(ALL_METRICS)
 
 @app.route("/predict/<disease>", methods=["POST"])
 def predict(disease):
-
     if disease not in MODELS:
-        return jsonify({"error": "Model not found"}), 404
+        return jsonify({"error": f"Model '{disease}' not loaded"}), 404
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "Request body must be valid JSON"}), 400
 
     model = MODELS[disease]
+
     try:
-        feat = parse_image_payload(data) if disease in IMAGE_DISEASES else parse_numeric_payload(disease, data)
+        feat = (parse_image_payload(data, disease)
+                if disease in IMAGE_DISEASES
+                else parse_numeric_payload(disease, data))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -516,4 +614,6 @@ def predict(disease):
 # RUN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(debug=True)
+    port  = int(os.getenv("PORT", 5000))
+    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host="0.0.0.0", port=port, debug=debug)
