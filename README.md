@@ -58,7 +58,7 @@ pip install -r backend/requirements.txt
 
 ---
 
-### 2. Train Models
+2. Train Models
 
 python scripts/download_and_train.py
 
